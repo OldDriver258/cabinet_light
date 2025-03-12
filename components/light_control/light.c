@@ -5,45 +5,86 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_console.h"
-#include "esp_log.h"
 #include "esp_check.h"
 #include "argtable3/argtable3.h"
+#include "nvs.h"
 #include "light.h"
-
-#define LIGHT_MAX               (6)
+/**
+ * light hardware define
+ */
 #define LIGHT_PWM_MAX           (LIGHT_MAX * 2)
-// #define LIGHT_PWM(x)            (light_control_config.pwms[(x-1)])
-
 #define LIGHT_DUTY_RESOLUTION   LEDC_TIMER_12_BIT
 #define LIGHT_FREQUENCY         (16000)
 #define LIGHT_DUTY_MAX          ((1 << LIGHT_DUTY_RESOLUTION) - 1)
 #define LIGHT_PULSE_DELAY       (4)
 #define LIGHT_STD_DUTY_MAX      (100)
 #define LIGHT_REL_DUTY_MAX      (95)
-
+/**
+ * light control define
+ */
+#define LIGHT_BRIGHTNESS_ZERO   (0)
+#define LIGHT_BRIGHTNESS_MIN    (1)
+#define LIGHT_BRIGHTNESS_MAX    (100)
+#define LIGHT_BRIGHTNESS_ONE    (20)
+#define LIGHT_BRIGHTNESS_STEP   (1)
 #define LIGHT_CCT_MIN           (3000)
 #define LIGHT_CCT_MAX           (6500)
-
+#define LIGHT_CCT_STEP          ((LIGHT_CCT_MAX - LIGHT_CCT_MIN) / ((LIGHT_BRIGHTNESS_MAX - LIGHT_BRIGHTNESS_ZERO) / LIGHT_BRIGHTNESS_STEP))
+#define LIGHT_UPDATE_DELAY_MS   (1)
+#define LIGHT_STOP_DELAY_MS     (100)
+#define LIGHT_DEFAULT_STATE     {4000, LIGHT_BRIGHTNESS_ZERO}
+#define LIGHT_NVS_NAMESPACE     "light"
+/**
+ * light control check define
+ */
 #define LIGHT_CHECK(a, str, ret_val) ESP_RETURN_ON_FALSE(a, ret_val, MODULE, "%s", str)
 #define LIGHT_ARG_CHECK(a, param) ESP_RETURN_ON_FALSE(a, ESP_ERR_INVALID_ARG, MODULE, param " argument is invalid")
-
-static const char* MODULE = "cabinet_light";
+/**
+ * light control typedef
+ */
+typedef struct {
+    bool                            ledc_initialized;               // LEDC hardware init
+    bool                            module_initialized;             // Whole module init
+    bool                            channel_initialized[LIGHT_MAX]; // Light channel init
+} light_module_state_t;
 
 typedef struct {
-    ledc_mode_t     speed_mode;
-    ledc_timer_t    timer_sel;
-    ledc_channel_t  channel;
-    int             gpio_num;
+    ledc_mode_t                     speed_mode;                     // PWM timer mode
+    ledc_timer_t                    timer_sel;                      // PWM timer
+    ledc_channel_t                  channel;                        // PWM channel
+    int                             gpio_num;                       // PWM gpio
 } light_control_pwm_t;
 
 typedef struct {
-    const light_control_pwm_t  *cold_pwm;
-    const light_control_pwm_t  *warm_pwm;
-    pthread_t                   thread;
-    pthread_mutex_t             running_mutex;
-    uint32_t                    running;
+    uint32_t                        cct;                            // Light color temperature
+    uint32_t                        brightness;                     // Light brightness
+} light_control_state_t;
+
+typedef struct {
+    int                             channel;                        // Light channel
+    const light_control_pwm_t      *cold_pwm;                       // Light cold pwm struct
+    const light_control_pwm_t      *warm_pwm;                       // Light warm pwm struct
+    pthread_t                       thread;                         // Light control thread
+    pthread_mutex_t                 mutex;                          // Light mutex
+    pthread_cond_t                  control_cond;                   // Light cond
+    volatile bool                   exit_requested;                 // Light thread exit request flag
+    volatile light_control_state_t  target;                         // Ligat target state
 } light_control_t;
 
+static struct {
+    struct arg_int                 *channel;                        // Light channel
+    struct arg_int                 *cct;                            // Light color temperature
+    struct arg_int                 *brightness;                     // Light brightness
+    struct arg_end                 *end;                            // Arg end
+} light_control_args;
+/**
+ * light control module global variables
+ */
+static const char* MODULE = "cabinet_light";
+static light_module_state_t module = {false};
+/**
+ * light control pwm global variables
+ */
 static const light_control_pwm_t pwms[LIGHT_PWM_MAX] = {
     {   //PWM1
         .speed_mode = LEDC_HIGH_SPEED_MODE,
@@ -118,12 +159,17 @@ static const light_control_pwm_t pwms[LIGHT_PWM_MAX] = {
         .gpio_num   = 23
     }
 };
-
+/**
+ * light control global variables
+ */
 static light_control_t lights[LIGHT_MAX];
-
-// Brightness 0 - 100% gamma correction look up table (gamma = 2.6)
-// Y = B ^ 2.6
-// Pre-computed LUT to save some runtime computation
+/**
+ * light control gamma correction global variables
+ * 
+ * Brightness 0 - 100% gamma correction look up table (gamma = 2.6)
+ * Y = B ^ 2.6
+ * Pre-computed LUT to save some runtime computation
+ */
 static const float gamma_correction_lut[101] = {
     0.000000, 0.000006, 0.000038, 0.000110, 0.000232, 0.000414, 0.000666, 0.000994, 0.001406, 0.001910,
     0.002512, 0.003218, 0.004035, 0.004969, 0.006025, 0.007208, 0.008525, 0.009981, 0.011580, 0.013328,
@@ -137,57 +183,21 @@ static const float gamma_correction_lut[101] = {
     0.760380, 0.782542, 0.805097, 0.828048, 0.851398, 0.875148, 0.899301, 0.923861, 0.948829, 0.974208,
     1.000000,
 };
-
-static struct {
-    struct arg_int *channel;
-    struct arg_int *pulse_width_a;
-    struct arg_int *pulse_width_b;
-    struct arg_end *end;
-} light_control_args;
-
-static int light_control_cmd(int argc, char **argv)
-{
-    int nerrors;
-    
-    nerrors = arg_parse(argc, argv, (void **) &light_control_args);
-    if (nerrors != 0) {
-        arg_print_errors(stderr, light_control_args.end, argv[0]);
-        return 1;
-    }
-
-    return light_set_and_update(light_control_args.channel->ival[0],
-                                light_control_args.pulse_width_a->ival[0],
-                                light_control_args.pulse_width_b->ival[0]);
-}
-
-esp_err_t register_light_control_cmd(void)
-{
-    light_control_args.channel = 
-        arg_int1("c", "channel", "<1-6>", "Select a light channel to control");
-    light_control_args.pulse_width_a = 
-        arg_int1("a", "pulse_width_a", "<0-100>", "Pulse widths of signal A, A+B <= 100");
-    light_control_args.pulse_width_b = 
-        arg_int1("b", "pulse_width_b", "<0-100>", "Pulse widths of signal B, A+B <= 100");
-    light_control_args.end = arg_end(3);
-
-    const esp_console_cmd_t cmd = {
-        .command    = "light",
-        .help       = "Control light status."
-                      "Specify the pulse widths of the two signals AB",
-        .hint       = NULL,
-        .func       = &light_control_cmd,
-        .argtable   = &light_control_args
-    };
-
-    return esp_console_cmd_register(&cmd);
-}
-
-esp_err_t light_ledc_init(void)
+/**
+ * @brief Initialize light control lec hardware
+ * @return Error code
+ */
+static esp_err_t light_control_ledc_init(void)
 {
     ledc_timer_config_t     ledc_timer;
     ledc_channel_config_t   ledc_channel;
     esp_err_t               err;
     int                     pwm_ch;
+
+    if (module.ledc_initialized) {
+        return ESP_OK;
+    }
+
     /*
      * Prepare and set configuration of timers
      * that will be used by LED Controller
@@ -228,22 +238,62 @@ esp_err_t light_ledc_init(void)
         }
     }
 
+    if (err == ESP_OK) {
+        module.ledc_initialized = true;
+    }
+
     return ESP_OK;
 }
-
-esp_err_t light_set_and_update(uint8_t light_ch, uint32_t cold_duty, uint32_t warm_duty)
+/**
+ * @brief Calculate the proportion of warm and cold light by color temperature
+ * @param state Light state
+ * @param cold_factor The proportion of cold light
+ * @param warm_factor The proportion of warm light
+ */
+static void light_control_calc_factor (light_control_state_t *state, float *cold_factor, float *warm_factor)
 {
-    light_control_t    *light = &lights[light_ch];
-    uint32_t            rel_cold_duty, rel_warm_duty;
+    *cold_factor = (float)(state->cct - LIGHT_CCT_MIN) / (LIGHT_CCT_MAX - LIGHT_CCT_MIN);
+    *warm_factor = (float)1 - *cold_factor;
+}
+/**
+ * @brief Calculate the corresponding gamma parameter by brightness
+ * @param state Light state
+ * @return Gamma parameter
+ */
+static float light_control_calc_gamma(light_control_state_t *state)
+{
+    uint32_t brightness;
+
+    if (state->brightness != LIGHT_BRIGHTNESS_ZERO) {
+        brightness = ((state->brightness - LIGHT_BRIGHTNESS_MIN) * 
+                      (LIGHT_BRIGHTNESS_MAX - LIGHT_BRIGHTNESS_ONE) / 
+                      (LIGHT_BRIGHTNESS_MAX - LIGHT_BRIGHTNESS_MIN)) + 
+                     LIGHT_BRIGHTNESS_ONE;
+    } else {
+        brightness = state->brightness;
+    }
+
+    return gamma_correction_lut[brightness];
+}
+/**
+ * @brief Adjust hardware duty to protect the hardware, the maximum duty cycle does not exceed 95%.
+ * @param duty Duty before adjustment
+ * @return Duty after adjustment
+ */
+static uint32_t light_control_hw_duty_adjustment(uint32_t duty)
+{
+    return duty * LIGHT_REL_DUTY_MAX / LIGHT_STD_DUTY_MAX;
+}
+/**
+ * @brief Set the corresponding duty cycle to the hardware
+ * @param light Light struct
+ * @param rel_cold_duty Real cold duty cycle
+ * @param rel_warm_duty Real warm duty cycle
+ * @return 
+ */
+static esp_err_t light_control_set_and_update(light_control_t *light, uint32_t rel_cold_duty, uint32_t rel_warm_duty)
+{
     esp_err_t           err;
-
-    LIGHT_ARG_CHECK((light_ch > 0 )&&(light_ch <= LIGHT_MAX), "light_ch");
-    LIGHT_ARG_CHECK(cold_duty <= LIGHT_STD_DUTY_MAX, "cold_duty");
-    LIGHT_ARG_CHECK(warm_duty <= LIGHT_STD_DUTY_MAX, "warm_duty");
-    LIGHT_ARG_CHECK(cold_duty + warm_duty <= LIGHT_STD_DUTY_MAX, "cold_duty+warm_duty");
-
-    rel_cold_duty = gamma_correction_lut[(cold_duty * LIGHT_REL_DUTY_MAX) / LIGHT_STD_DUTY_MAX] * (1 << LIGHT_DUTY_RESOLUTION);
-    rel_warm_duty = gamma_correction_lut[(warm_duty * LIGHT_REL_DUTY_MAX) / LIGHT_STD_DUTY_MAX] * (1 << LIGHT_DUTY_RESOLUTION);
 
     err = ledc_set_duty_with_hpoint(light->cold_pwm->speed_mode, light->cold_pwm->channel, 
                                     rel_cold_duty, 0);
@@ -279,57 +329,330 @@ esp_err_t light_set_and_update(uint8_t light_ch, uint32_t cold_duty, uint32_t wa
 
     return ESP_OK;
 }
-
-static esp_err_t light_cct_and_brightness_to_duty (uint32_t cct, uint32_t brightness, 
-                                                   uint32_t *cold_duty, uint32_t *warm_duty)
+/**
+ * @brief Sets the light to the specified state
+ * @param light Light struct
+ * @param state Light state
+ * @return Error code
+ */
+static esp_err_t light_control_set_state(light_control_t *light, light_control_state_t *state)
 {
-    uint32_t    cold_percent, warm_percent;
+    float       cold_factor, warm_factor;
+    float       total_gamma;
+    uint32_t    rel_cold_duty, rel_warm_duty;
 
-    LIGHT_ARG_CHECK((cct >= LIGHT_CCT_MIN) && (cct <= LIGHT_CCT_MAX), "cct");
-    LIGHT_ARG_CHECK(brightness <= 100, "brightness");
+    LIGHT_ARG_CHECK((state->cct >= LIGHT_CCT_MIN) && (state->cct <= LIGHT_CCT_MAX), "state->cct");
+    LIGHT_ARG_CHECK(state->brightness <= LIGHT_BRIGHTNESS_MAX, "state->brightness");
 
-    cold_percent = (cct - LIGHT_CCT_MIN) * 100 / (LIGHT_CCT_MAX - LIGHT_CCT_MIN);
-    warm_percent = 100 - cold_percent;
+    // Calculate cold and warm light factor
+    light_control_calc_factor(state, &cold_factor, &warm_factor);
 
-    *cold_duty = cold_percent * brightness / 100;
-    *warm_duty = warm_percent * brightness / 100;
+    // Calculate gamma corresponding to brightness
+    total_gamma = light_control_calc_gamma(state);
 
-    return ESP_OK;
+    // Calculate harmware duty
+    rel_cold_duty = total_gamma * cold_factor * (1 << LIGHT_DUTY_RESOLUTION);
+    rel_warm_duty = total_gamma * warm_factor * (1 << LIGHT_DUTY_RESOLUTION);
+
+    // Adjust the max duty <= 95%
+    rel_cold_duty = light_control_hw_duty_adjustment(rel_cold_duty);
+    rel_warm_duty = light_control_hw_duty_adjustment(rel_warm_duty);
+
+    // Update to hardware
+    return light_control_set_and_update(light, rel_cold_duty, rel_warm_duty);
 }
-
-esp_err_t light_set_cct_and_brightness(uint8_t light_ch, uint32_t cct, uint32_t brightness)
+/**
+ * @brief Light control delay
+ * @param light Light struct
+ * @param ms Millisecond
+ */
+static void light_control_timewait(light_control_t *light, uint32_t ms)
 {
-    uint32_t    cold_duty, warm_duty;
-    esp_err_t   err;
+    struct timespec timeout;
 
-    err = light_cct_and_brightness_to_duty(cct, brightness, &cold_duty, &warm_duty);
+    pthread_mutex_lock(&light->mutex);
+
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_nsec += ms * 1000 * 1000;
+    if (timeout.tv_nsec >= 1000000000) {
+        timeout.tv_sec += 1;
+        timeout.tv_nsec -= 1000000000;
+    }
+    pthread_cond_timedwait(&light->control_cond, &light->mutex, &timeout);
+
+    pthread_mutex_unlock(&light->mutex);
+}
+/**
+ * @brief Set the target state of the light
+ * @param light Light struct
+ * @param state Target state
+ */
+static void light_control_set_target(light_control_t *light, light_control_state_t *state)
+{
+    pthread_mutex_lock(&light->mutex);
+
+    light->target.brightness = state->brightness;
+    light->target.cct        = state->cct;
+    pthread_cond_signal(&light->control_cond);
+
+    pthread_mutex_unlock(&light->mutex);
+}
+/**
+ * @brief Storage light status
+ * @param light Light struct
+ * @param state Store state
+ * @return Error code
+ */
+static esp_err_t light_control_storage_set(light_control_t *light, light_control_state_t *state)
+{
+    char            key[NVS_KEY_NAME_MAX_SIZE];
+    esp_err_t       err;
+    nvs_handle_t    handle;
+
+    err = nvs_open(LIGHT_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
-        ESP_LOGE(MODULE, "invalid cct and brightness param.");
+        ESP_LOGE(MODULE, "Error (%s) opening NVS handle!\n", esp_err_to_name(err));
         return err;
     }
 
-    return light_set_and_update(light_ch, cold_duty, warm_duty);
-}
+    snprintf(key, sizeof(key), "light%d_cct", light->channel);
+    err = nvs_set_u32(handle, key, state->cct);
+    if (err != ESP_OK) {
+        ESP_LOGE(MODULE, "Error (%s) set NVS u32 cct!\n", esp_err_to_name(err));
+    }
 
-static void *light_conrtol_thread(void *arg)
+    snprintf(key, sizeof(key), "light%d_brt", light->channel);
+    err = nvs_set_u32(handle, key, state->brightness);
+    if (err != ESP_OK) {
+        ESP_LOGE(MODULE, "Error (%s) set NVS u32 brightness!\n", esp_err_to_name(err));
+    }
+
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(MODULE, "Error (%s) NVS commit failed!\n", esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+
+    return err;
+}
+/**
+ * @brief Read the status of the light
+ * @param light Light struct
+ * @param state Read state
+ * @return Error code
+ */
+static esp_err_t light_control_storage_get(light_control_t *light, light_control_state_t *state)
 {
+    char            key[NVS_KEY_NAME_MAX_SIZE];
+    esp_err_t       err;
+    nvs_handle_t    handle;
+
+    err = nvs_open(LIGHT_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(MODULE, "Error (%s) opening NVS handle!\n", esp_err_to_name(err));
+        return err;
+    }
+
+    snprintf(key, sizeof(key), "light%d_cct", light->channel);
+    err = nvs_get_u32(handle, key, &state->cct);
+    switch (err) {
+        case ESP_OK:
+            break;
+        case ESP_ERR_NVS_NOT_FOUND:
+            ESP_LOGE(MODULE, "The value is not initialized yet!\n");
+            break;
+        default :
+            ESP_LOGE(MODULE, "Error (%s) reading!\n", esp_err_to_name(err));
+    }
+
+    snprintf(key, sizeof(key), "light%d_brt", light->channel);
+    err = nvs_get_u32(handle, key, &state->brightness);
+    switch (err) {
+        case ESP_OK:
+            break;
+        case ESP_ERR_NVS_NOT_FOUND:
+            ESP_LOGE(MODULE, "The value is not initialized yet!\n");
+            break;
+        default :
+            ESP_LOGE(MODULE, "Error (%s) reading!\n", esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+
+    return err;
+}
+/**
+ * @brief Light control command line program
+ * @param argc 
+ * @param argv 
+ * @return Error code
+ */
+static int light_control_cmd(int argc, char **argv)
+{
+    int                     nerrors;
+    uint8_t                 light_ch;
+    light_control_state_t   state;
+    
+    nerrors = arg_parse(argc, argv, (void **) &light_control_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, light_control_args.end, argv[0]);
+        return 1;
+    }
+
+    // Get light status from command line
+    light_ch            = light_control_args.channel->ival[0] - 1;
+    state.cct           = light_control_args.cct->ival[0];
+    state.brightness    = light_control_args.brightness->ival[0];
+
+    // Check correct light param
+    LIGHT_ARG_CHECK(light_ch < LIGHT_MAX, "light_ch");
+    LIGHT_ARG_CHECK((state.cct >= LIGHT_CCT_MIN) && (state.cct <= LIGHT_CCT_MAX), "cct");
+    LIGHT_ARG_CHECK(state.brightness <= LIGHT_BRIGHTNESS_MAX, "brightness");
+
+    // Set light target
+    light_control_set_target(&lights[light_ch], &state);
+
+    return ESP_OK;
+}
+/**
+ * @brief Register the light control command line program
+ * @return Error code
+ */
+static esp_err_t light_control_register_cmd(void)
+{
+    static char channel_range[32], temperature_range[32], brightness_range[32];
+
+    snprintf(channel_range, sizeof(channel_range), "<%d-%d>", 1, LIGHT_MAX);
+    snprintf(brightness_range, sizeof(brightness_range), "<%d-%d>", LIGHT_BRIGHTNESS_ZERO, LIGHT_BRIGHTNESS_MAX);
+    snprintf(temperature_range, sizeof(temperature_range), "<%d-%d>", LIGHT_CCT_MIN, LIGHT_CCT_MAX);
+
+    light_control_args.channel = 
+        arg_int1("c", "channel", channel_range, "Select a light channel to control.");
+    light_control_args.cct = 
+        arg_int1("t", "temperature", temperature_range, "Set target color temperature.");
+    light_control_args.brightness = 
+        arg_int1("b", "brightness", brightness_range, "Set target brightness.");
+    light_control_args.end = arg_end(3);
+
+    const esp_console_cmd_t cmd = {
+        .command    = "light",
+        .help       = "Control light status."
+                      "Specify color temperature and brightness.",
+        .hint       = NULL,
+        .func       = &light_control_cmd,
+        .argtable   = &light_control_args
+    };
+
+    return esp_console_cmd_register(&cmd);
+}
+/**
+ * @brief Light control thread
+ * @param arg Light struct
+ * @return Exit code
+ */
+static void *light_control_thread(void *arg)
+{
+    light_control_t        *light       = (light_control_t*)arg;
+    light_control_state_t   start_state = LIGHT_DEFAULT_STATE;
+    light_control_state_t   current, target;
+
+    current.brightness = LIGHT_BRIGHTNESS_ZERO;
+    current.cct        = (LIGHT_CCT_MAX + LIGHT_CCT_MIN) / 2;
+
+    light_control_storage_get(light, &start_state);
+    light_control_set_target(light, &start_state);
+
     while (true)
     {
-        pthread_testcancel();
-        usleep(10000);
+        // Check if you should exit
+        pthread_mutex_lock(&light->mutex);
+
+        if (light->exit_requested) {
+            pthread_mutex_unlock(&light->mutex);
+            break;
+        }
+
+        // Read target status
+        target = light->target;
+        pthread_mutex_unlock(&light->mutex);
+
+        if ((current.brightness != target.brightness) ||
+            (current.cct        != target.cct)) {
+            // Smooth brightness adjustment
+            if (target.brightness > current.brightness) {
+                current.brightness += LIGHT_BRIGHTNESS_STEP;
+                if (current.brightness > target.brightness) {
+                    current.brightness = target.brightness;
+                }
+            } else if (target.brightness < current.brightness) {
+                current.brightness -= LIGHT_BRIGHTNESS_STEP;
+                if (current.brightness < target.brightness) {
+                    current.brightness = target.brightness;
+                }
+            }
+
+            // Smoothly adjust color temperature
+            if (target.cct > current.cct) {
+                current.cct += LIGHT_CCT_STEP;
+                if (current.cct > target.cct) {
+                    current.cct = target.cct;
+                }
+            } else if (target.cct < current.cct) {
+                current.cct -= LIGHT_CCT_STEP;
+                if (current.cct < target.cct) {
+                    current.cct = target.cct;
+                }
+            }
+            
+            // Update color temperature and brightness
+            light_control_set_state(light, &current);
+
+            if ((current.brightness == target.brightness) ||
+                (current.cct        == target.cct)) {
+                    light_control_storage_set(light, &current);
+                }
+
+            light_control_timewait(light, LIGHT_UPDATE_DELAY_MS);
+        } else {
+            // Idle wait, just check for exit
+            light_control_timewait(light, LIGHT_STOP_DELAY_MS);
+        }
     }
     
     return NULL;
 }
-
-esp_err_t light_control_start(void)
+/**
+ * @brief Start the light control of the corresponding channel
+ * @param channel Light channel
+ * @return Error code
+ */
+esp_err_t light_control_start(int channel)
 {
     light_control_t    *light;
-    pthread_attr_t      attr;
     uint8_t             light_ch;
+    pthread_attr_t      attr;
     esp_err_t           err;
 
-    memset(lights, 0, sizeof(lights));
+    LIGHT_ARG_CHECK((channel > 0) && (channel <= LIGHT_MAX), "channel");
+
+    if (!module.ledc_initialized) {
+        ESP_LOGE(MODULE, "LEDC hardware not initialized, call light_module_init() first");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    light_ch        = channel - 1;
+    light           = &lights[light_ch];
+
+    if (module.channel_initialized[light_ch]) {
+        ESP_LOGW(MODULE, "Channel %d already initialized, stopping first", channel);
+        light_control_stop(channel);
+    }
+
+    memset(light, 0, sizeof(light_control_t));
+    light->channel  = channel;
+    light->warm_pwm = &pwms[light_ch * 2];
+    light->cold_pwm = &pwms[light_ch * 2 + 1];
 
     err = pthread_attr_init(&attr);
     if (err != ESP_OK) {
@@ -337,51 +660,108 @@ esp_err_t light_control_start(void)
         return err;
     }
 
-    for (light_ch = 0; light_ch < LIGHT_MAX; light_ch++) {
-        light           = &lights[light_ch];
-        light->cold_pwm = &pwms[light_ch * 2];
-        light->warm_pwm = &pwms[light_ch * 2 - 1];
+    err = pthread_mutex_init(&light->mutex, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(MODULE, "Failed init mutex(%d).", light_ch);
 
-        err = pthread_mutex_init(&light->running_mutex, NULL);
-        if (err != ESP_OK) {
-            ESP_LOGE(MODULE, "Failed init mutex(%d).", light_ch);
-            goto _exit;
-        }
+        pthread_attr_destroy(&attr);
+        return err;
+    }
 
-        // start light control
-        pthread_mutex_lock(&light->running_mutex);
-        light->running  = 1;
-        pthread_mutex_unlock(&light->running_mutex);
+    err = pthread_cond_init(&light->control_cond, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(MODULE, "Failed init condition variable(%d).", light_ch);
 
-        err = pthread_create(&light->thread, &attr, light_conrtol_thread, NULL);
-        if (err != ESP_OK) {
-            ESP_LOGE(MODULE, "Failed creat thread(%d).", light_ch);
-            goto _exit;
-        }
+        pthread_mutex_destroy(&light->mutex);
+        pthread_attr_destroy(&attr);
+        return err;
+    }
+
+    // start light control
+    pthread_mutex_lock(&light->mutex);
+    light->exit_requested = false;
+    pthread_mutex_unlock(&light->mutex);
+
+    err = pthread_create(&light->thread, &attr, light_control_thread, light);
+    if (err != ESP_OK) {
+        ESP_LOGE(MODULE, "Failed creat thread(%d).", light_ch);
+
+        pthread_cond_destroy(&light->control_cond);
+        pthread_mutex_destroy(&light->mutex);
+        pthread_attr_destroy(&attr);
+        return err;
     }
 
     pthread_attr_destroy(&attr);
+
+    module.channel_initialized[light_ch] = true;
+
     return ESP_OK;
+}
+/**
+ * @brief Stop the light control of the corresponding channel
+ * @param channel Light channel
+ * @return Error code
+ */
+esp_err_t light_control_stop(int channel)
+{
+    light_control_t    *light;
+    uint8_t             light_ch;
 
-_exit:
-    for (light_ch = 0; light_ch < LIGHT_MAX; light_ch++) {
-        light   = &lights[light_ch];
+    LIGHT_ARG_CHECK((channel > 0) && (channel <= LIGHT_MAX), "channel");
 
-        if (light->thread) {
-            // stop light control
-            pthread_mutex_lock(&light->running_mutex);
-            light->running  = 0;
-            pthread_mutex_unlock(&light->running_mutex);    
+    light_ch    = channel - 1;
+    light       = &lights[light_ch];
 
-            pthread_join(light->thread, NULL);
-            light->thread = 0;
-        }
+    if (light->thread) {
+        // stop light control
+        pthread_mutex_lock(&light->mutex);
+        light->exit_requested  = true;
+        pthread_cond_signal(&light->control_cond);
+        pthread_mutex_unlock(&light->mutex);
 
-        if (light->running_mutex) {
-            pthread_mutex_destroy(&light->running_mutex);
-        }
+        pthread_join(light->thread, NULL);
+        light->thread = 0;
     }
 
-    pthread_attr_destroy(&attr);
-    return err;
+    if (light->control_cond) {
+        pthread_cond_destroy(&light->control_cond);
+    }
+
+    if (light->mutex) {
+        pthread_mutex_destroy(&light->mutex);
+    }
+
+    module.channel_initialized[light_ch] = false;
+
+    return ESP_OK;
 }
+/**
+ * @brief Light module initialization
+ * @return Error code
+ */
+esp_err_t light_module_init(void)
+{
+    esp_err_t err;
+
+    if (module.module_initialized) {
+        return ESP_OK;
+    }
+
+    err = light_control_ledc_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(MODULE, "Failed to initialize LEDC hardware");
+        return err;
+    }
+
+    err = light_control_register_cmd();
+    if (err != ESP_OK) {
+        ESP_LOGE(MODULE, "Failed to register console commands");
+        return err;
+    }
+
+    module.module_initialized = true;
+    
+    return ESP_OK;
+}
+

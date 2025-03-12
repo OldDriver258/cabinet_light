@@ -84,9 +84,6 @@ static void esp_system_init(void)
 #endif
     register_nvs();
 
-    /* Register custom commands */
-    register_light_control_cmd();
-
     #if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) || defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
@@ -110,5 +107,8 @@ void app_main(void)
 {
     esp_chip_info_show();
     esp_system_init();
-    light_ledc_init();
+
+    light_module_init();
+
+    light_control_start(1);
 }
