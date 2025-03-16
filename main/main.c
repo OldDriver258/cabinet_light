@@ -111,4 +111,9 @@ void app_main(void)
     light_module_init();
 
     light_control_start(1);
+    light_control_start(2);
+    light_control_start(3);
+    light_control_start(4);
+    light_control_start(5);
+    light_control_start(6);
 }

@@ -505,6 +505,12 @@ static int light_control_cmd(int argc, char **argv)
     state.cct           = light_control_args.cct->ival[0];
     state.brightness    = light_control_args.brightness->ival[0];
 
+    // Check light state
+    if (!module.channel_initialized[light_ch]) {
+        ESP_LOGE(MODULE, "Select channel %d did not initialized! Start it first", light_ch + 1);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     // Check correct light param
     LIGHT_ARG_CHECK(light_ch < LIGHT_MAX, "light_ch");
     LIGHT_ARG_CHECK((state.cct >= LIGHT_CCT_MIN) && (state.cct <= LIGHT_CCT_MAX), "cct");
